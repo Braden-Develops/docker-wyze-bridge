@@ -190,6 +190,8 @@ func main() {
 		})
 	})
 
+	gwellWake := newGwellWaker(apiClient)
+
 	webuiLog := log.With().Str("c", "webui").Logger()
 	webServer := webui.NewServer(webui.Options{
 		Config:    cfg,
@@ -199,7 +201,7 @@ func main() {
 		RootCtx:   ctx,
 		Issues:    issueReg,
 		Mars:      apiClient,
-		KVS:       kvsAdapter{api: apiClient, gwellWake: newGwellWaker(apiClient)},
+		KVS:       kvsAdapter{api: apiClient, gwellWake: gwellWake},
 		Cloud:     apiClient,
 		AuthPhoneID: func() string {
 			if a := apiClient.Auth(); a != nil {
@@ -236,6 +238,18 @@ func main() {
 
 	go2rtcLog := log.With().Str("c", "go2rtc").Logger()
 	go2rtcAPI, go2rtcMgr := setupGo2RTC(ctx, cfg, camMgr, go2rtcLog)
+
+	// Initial discovery has run by now. Ready the P2P wake path for any
+	// sleeping Gwell doorbell so its first stream request is not held up
+	// by P2P server discovery. One account shares one P2P server, so the
+	// first doorbell found is enough; a doorbell added later is primed
+	// by its first wake instead.
+	for _, cam := range camMgr.Cameras() {
+		if info := cam.GetInfo(); info.NeedsWake() && info.IsGwell() {
+			gwellWake.Prime(info.MAC)
+			break
+		}
+	}
 
 	// Inject the API client into camera manager and WebUI now that
 	// go2rtc is reachable. Any in-flight WebUI request that was waiting
