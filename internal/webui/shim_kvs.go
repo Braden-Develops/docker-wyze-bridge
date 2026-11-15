@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -18,13 +19,25 @@ type KVSStreamProvider interface {
 // KVSWaker is optionally implemented by the KVSStreamProvider. Battery
 // doorbells (Doorbell Pro lineage) sleep and ignore a WebRTC offer until
 // woken, so the shim wakes them before handing go2rtc the signaling URL.
+//
+// WakeCamera returns nil once the camera is confirmed ready for an
+// offer. It returns ErrWakePending when the wake is under way but not
+// confirmed in the time the shim can spare; the shim then answers 503
+// rather than hand out a signaling URL for an offer the camera would
+// ignore (go2rtc would wait about 50s on it). Any other error means the
+// wake could not be attempted, and the shim streams anyway in case the
+// camera is up.
 type KVSWaker interface {
 	WakeCamera(ctx context.Context, mac, model string) error
 }
 
+// ErrWakePending is returned by KVSWaker.WakeCamera while a wake is in
+// progress but not yet confirmed. The caller should retry shortly.
+var ErrWakePending = errors.New("camera wake still in progress")
+
 // kvsWakeSettle gives a freshly-woken camera a moment to join the
 // signaling channel before go2rtc sends its SDP offer.
-var kvsWakeSettle = 500 * time.Millisecond
+var kvsWakeSettle = 300 * time.Millisecond
 
 // KVSIceServer matches the shape go2rtc's kinesis client deserializes
 // (pkg/webrtc UnmarshalICEServers reads "urls"; with "url" it silently gets
@@ -78,13 +91,33 @@ func (s *Server) handleShimKVSSignaling(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// go2rtc gives this request 5s in total, and waking a doorbell uses
+	// most of it, so the signaling URL is fetched while the wake runs.
+	type streamResult struct {
+		signalingURL string
+		iceServers   []KVSIceServer
+		err          error
+	}
+	streamCh := make(chan streamResult, 1)
+	go func() {
+		u, ice, _, err := s.kvs.GetCameraStream(r.Context(), info.MAC, info.Model)
+		streamCh <- streamResult{u, ice, err}
+	}()
+
 	if waker, ok := s.kvs.(KVSWaker); ok && info.NeedsWake() {
-		if err := waker.WakeCamera(r.Context(), info.MAC, info.Model); err != nil {
-			// Best effort: the camera may already be awake (app open,
+		err := waker.WakeCamera(r.Context(), info.MAC, info.Model)
+		switch {
+		case errors.Is(err, ErrWakePending):
+			s.log.Info().Str("cam", streamID).Msg("kvs wakeup not confirmed yet; asking the client to retry")
+			w.Header().Set("Retry-After", "3")
+			http.Error(w, "camera is waking up, retry shortly", http.StatusServiceUnavailable)
+			return
+		case err != nil:
+			// Best effort: the camera may already be up (app open,
 			// doorbell pressed), so still try to stream.
 			s.log.Warn().Err(err).Str("cam", streamID).Msg("kvs wakeup failed")
-		} else {
-			s.log.Debug().Str("cam", streamID).Msg("kvs wakeup sent")
+		default:
+			s.log.Debug().Str("cam", streamID).Msg("kvs wakeup confirmed")
 			select {
 			case <-time.After(kvsWakeSettle):
 			case <-r.Context().Done():
@@ -93,7 +126,13 @@ func (s *Server) handleShimKVSSignaling(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	signalingURL, iceServers, _, err := s.kvs.GetCameraStream(r.Context(), info.MAC, info.Model)
+	var res streamResult
+	select {
+	case res = <-streamCh:
+	case <-r.Context().Done():
+		return
+	}
+	signalingURL, iceServers, err := res.signalingURL, res.iceServers, res.err
 	if err != nil {
 		s.log.Warn().Err(err).Str("cam", streamID).Msg("kvs get_streams failed")
 		http.Error(w, err.Error(), http.StatusBadGateway)

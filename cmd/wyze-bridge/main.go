@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -971,14 +972,19 @@ func (a kvsAdapter) GetCameraStream(_ context.Context, mac, model string) (strin
 
 // WakeCamera implements webui.KVSWaker for sleeping battery doorbells.
 // Gwell doorbells are woken over Gwell P2P; there is no wake method for
-// other lineages. errGwellWakePending means the wake is still running
-// in the background and the caller's retry will find the doorbell awake.
+// other lineages. A wake that is still running when the request has to
+// answer is reported as webui.ErrWakePending, so the shim asks the
+// client to retry instead of handing out a signaling URL too early.
 func (a kvsAdapter) WakeCamera(ctx context.Context, mac, model string) error {
 	cam := wyzeapi.CameraInfo{MAC: mac, Model: model}
 	if !cam.IsGwell() || a.gwellWake == nil {
 		return fmt.Errorf("no wake method for model %s", model)
 	}
-	return a.gwellWake.Wake(ctx, mac)
+	err := a.gwellWake.Wake(ctx, mac)
+	if errors.Is(err, errGwellWakePending) {
+		return webui.ErrWakePending
+	}
+	return err
 }
 
 func findGo2RTCBinary() string {

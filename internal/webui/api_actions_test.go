@@ -104,9 +104,9 @@ type fakeRecMgr struct {
 	recording bool
 }
 
-func (f *fakeRecMgr) IsRecording(_ string) bool        { return f.recording }
-func (f *fakeRecMgr) ActiveRecorders() []string         { return nil }
-func (f *fakeRecMgr) SessionBytes(_ string) int64       { return 0 }
+func (f *fakeRecMgr) IsRecording(_ string) bool   { return f.recording }
+func (f *fakeRecMgr) ActiveRecorders() []string   { return nil }
+func (f *fakeRecMgr) SessionBytes(_ string) int64 { return 0 }
 
 func TestHandleAPICameraAction_RecordStartStop(t *testing.T) {
 	srv, _ := testServer(t)
@@ -352,5 +352,24 @@ func TestHandleShimKVSSignaling_WakesSleepingDoorbell(t *testing.T) {
 		if got := len(p.woke) == 1; got != tc.wantWake {
 			t.Errorf("%s: woke = %v, want wake %v", tc.model, p.woke, tc.wantWake)
 		}
+	}
+}
+
+func TestHandleShimKVSSignaling_WakePendingAsksForRetry(t *testing.T) {
+	srv, _ := testServer(t)
+	cam := camera.NewCamera(wyzeapi.CameraInfo{Name: "cam", Model: "GW_BE1", MAC: "MAC1"}, "hd", true, false)
+	srv.camMgr.InjectCamera("cam", cam)
+	srv.kvs = &wakingKVSProvider{fakeKVSProvider: fakeKVSProvider{signalingURL: "wss://x"}, wakeErr: ErrWakePending}
+
+	req := httptest.NewRequest("GET", "/internal/wyze/webrtc/cam", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	w := httptest.NewRecorder()
+	srv.handleShimKVSSignaling(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s; an unconfirmed wake must not hand out a signaling URL", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
 	}
 }

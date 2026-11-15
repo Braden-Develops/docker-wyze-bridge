@@ -19,10 +19,16 @@ const (
 	// reported in about 3s after the wake message.
 	gwellWakeListen = 10 * time.Second
 	// gwellWakeBudget is how long a stream request waits on a wake.
-	// go2rtc gives the shim 5s in total to answer; a wake that needs
-	// longer keeps running in the background while the request goes
-	// ahead, and a retry sends a fresh wake.
-	gwellWakeBudget = 3500 * time.Millisecond
+	// go2rtc gives the shim 5s in total to answer. A wake that needs
+	// longer keeps running in the background, the request is told to
+	// retry, and the retry uses that wake once it is confirmed. A
+	// sleeping Doorbell Pro confirms in about 3s; one that is already
+	// awake can take 4.5 to 5.5s.
+	gwellWakeBudget = 4200 * time.Millisecond
+	// gwellArmedWindow is how long a confirmed wake stays good for a
+	// request that has not used it yet. An offer sent about 10s after a
+	// wake, with no session in between, was answered.
+	gwellArmedWindow = 10 * time.Second
 	// gwellSessionReuse is how long the P2P session is kept open after
 	// a wake so the next wake can reuse it. The P2P server ignores a new
 	// session opened within roughly 17s of the previous one, which made
@@ -55,21 +61,21 @@ type gwellWaker struct {
 	sessMac  string             // the doorbell sess targets
 	sessUsed time.Time          // when sess last carried a wake
 
-	mu        sync.Mutex
-	inflight  map[string]chan struct{} // mac -> closed when its wake ends
-	lastAwake map[string]bool          // mac -> last finished wake confirmed the doorbell awake
-	lastErr   map[string]error         // mac -> error of the last finished wake
-	server    string                   // P2P server that last worked (skips ~6s discovery)
-	priming   bool                     // a Prime is running
-	devices   []gwell.DeviceInfo       // account device list (server may omit it on back-to-back sessions)
+	mu       sync.Mutex
+	inflight map[string]chan struct{} // mac -> closed when its wake ends
+	armedAt  map[string]time.Time     // mac -> when a wake was confirmed and not yet used by a request
+	lastErr  map[string]error         // mac -> error of the last finished wake
+	server   string                   // P2P server that last worked (skips ~6s discovery)
+	priming  bool                     // a Prime is running
+	devices  []gwell.DeviceInfo       // account device list (server may omit it on back-to-back sessions)
 }
 
 func newGwellWaker(api *wyzeapi.Client) *gwellWaker {
 	return &gwellWaker{
-		api:       api,
-		inflight:  map[string]chan struct{}{},
-		lastAwake: map[string]bool{},
-		lastErr:   map[string]error{},
+		api:      api,
+		inflight: map[string]chan struct{}{},
+		armedAt:  map[string]time.Time{},
+		lastErr:  map[string]error{},
 	}
 }
 
@@ -151,13 +157,19 @@ func (w *gwellWaker) primeOnce(mac string) error {
 // than gwellWakeBudget (the wake carries on in the background), or the
 // wake's own error.
 //
-// Every call sends a message and waits, even seconds after the last
-// one. A Doorbell Pro that is still awake from a previous session
-// ignores a WebRTC offer unless a wake message came first, and needs
-// about 3s after the message just as a sleeping one does. A call made
-// while a wake is already in flight joins it.
+// Each stream session needs its own wake: a Doorbell Pro that is still
+// awake from a previous session ignores a WebRTC offer unless a wake
+// message came first, and needs time after the message just as a
+// sleeping one does. So a confirmed wake is handed to exactly one
+// caller. A caller that gave up waiting (errGwellWakePending) and comes
+// back within gwellArmedWindow gets the wake it started; otherwise a
+// new one is sent. A call made while a wake is in flight joins it.
 func (w *gwellWaker) Wake(ctx context.Context, mac string) error {
 	w.mu.Lock()
+	if w.takeArmed(mac) {
+		w.mu.Unlock()
+		return nil
+	}
 	done, running := w.inflight[mac]
 	if !running {
 		done = make(chan struct{})
@@ -179,10 +191,21 @@ func (w *gwellWaker) Wake(ctx context.Context, mac string) error {
 	if err := w.lastErr[mac]; err != nil {
 		return err
 	}
-	if w.lastAwake[mac] {
+	if w.takeArmed(mac) {
 		return nil
 	}
 	return fmt.Errorf("gwell p2p wake sent but the doorbell did not report online within %s", gwellWakeListen)
+}
+
+// takeArmed reports whether a confirmed, unused wake is available for
+// mac, and uses it up. Call with mu held.
+func (w *gwellWaker) takeArmed(mac string) bool {
+	at, ok := w.armedAt[mac]
+	if !ok {
+		return false
+	}
+	delete(w.armedAt, mac)
+	return time.Since(at) < gwellArmedWindow
 }
 
 // run performs one wake and records its outcome. It is not tied to the
@@ -191,7 +214,9 @@ func (w *gwellWaker) run(mac string, done chan struct{}) {
 	res, err := w.wakeOnce(mac)
 	w.mu.Lock()
 	w.lastErr[mac] = err
-	w.lastAwake[mac] = err == nil && res.Online
+	if err == nil && res.Online {
+		w.armedAt[mac] = time.Now()
+	}
 	delete(w.inflight, mac)
 	w.mu.Unlock()
 	close(done)
