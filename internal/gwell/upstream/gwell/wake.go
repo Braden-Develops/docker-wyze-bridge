@@ -59,6 +59,13 @@ type WakeOptions struct {
 	// sending. Only the diagnostic needs it (to print the dump and the
 	// device's state before the message goes out).
 	SubscribeDrain time.Duration
+	// Repeat makes Session.Wake send the message this many more times on
+	// the same session, RepeatEvery apart, listening after each.
+	// Heartbeat, if set, sends a session heartbeat that often while idle
+	// between them. Diagnostic only.
+	Repeat      int
+	RepeatEvery time.Duration
+	Heartbeat   time.Duration
 }
 
 // WakeResult is what one Wake call observed.
@@ -111,65 +118,156 @@ func BuildPassthroughMsg(token *AccessToken, routingSessionID uint64, sqnum uint
 	return frame, msgID
 }
 
-// ServerAddr returns the P2P server this session connected to, so a
-// caller can pass it back as SessionConfig.ServerAddr and skip
-// discovery next time.
-func (s *Session) ServerAddr() string { return s.serverAddr }
+// WakeSession is a registered P2P session that can send wake messages
+// to one device. Keep it open and reuse it for wakes that come close
+// together: the P2P server ignores a new session opened within roughly
+// 17s of the account's previous one (its setup goes unanswered and
+// anything sent on it is dropped), whereas one session carried five
+// wakes 12s apart. An idle session stops working somewhere between 45s
+// and 75s, so close it well before that.
+type WakeSession struct {
+	s    *Session
+	seen map[string]bool
+	// state is the device's state from the state dump, if it arrived.
+	state int
+}
 
-// Devices returns the account's P2P device list as learned by this
-// session. Pass it back as SessionConfig.Devices: the server sometimes
-// omits the list from a session opened right after another one.
-func (s *Session) Devices() []DeviceInfo { return s.devices }
-
-// Wake registers with the P2P server, subscribes, and sends one
-// passthrough message with the wake flag to the target device. It then
-// waits up to opts.Listen for the device to publish a fresh "_online"
-// state. It never starts a call or a media session.
-func (s *Session) Wake(opts WakeOptions) (WakeResult, error) {
-	defer s.Close()
-	var res WakeResult
-
+// OpenWakeSession connects, certifies, registers and subscribes. With
+// drain > 0 it then reads the server's state dump for that long (the
+// diagnostic uses this to print it). It fails if the server does not
+// establish the session, which is what happens to one opened too soon
+// after another.
+func OpenWakeSession(cfg SessionConfig, drain time.Duration) (*WakeSession, error) {
+	s := NewSession(cfg)
 	if err := s.connect(); err != nil {
-		return res, fmt.Errorf("connect: %w", err)
+		s.Close()
+		return nil, fmt.Errorf("connect: %w", err)
 	}
 	if err := s.certify(); err != nil {
-		return res, fmt.Errorf("certify: %w", err)
+		s.Close()
+		return nil, fmt.Errorf("certify: %w", err)
 	}
 	if len(s.cfg.Devices) > 0 {
 		s.devices = s.cfg.Devices
 	}
 	if err := s.initInfo(); err != nil {
-		return res, fmt.Errorf("initInfo: %w", err)
+		s.Close()
+		return nil, fmt.Errorf("initInfo: %w", err)
+	}
+	// With a pre-populated device list initInfo returns nil even when
+	// the server never answered, so check the session really exists.
+	if s.routingSessionID == 0 {
+		s.Close()
+		return nil, fmt.Errorf("P2P server did not establish the session (opened too soon after another one?)")
 	}
 	if s.cfg.DeviceName != "" && s.targetDev.Name != s.cfg.DeviceName {
-		return res, fmt.Errorf("device %q is not on this account's P2P device list", s.cfg.DeviceName)
+		s.Close()
+		return nil, fmt.Errorf("device %q is not on this account's P2P device list", s.cfg.DeviceName)
 	}
 
-	// The subscribe and the wake message go out back to back: the
-	// message is needed whatever the device's state, so there is no
-	// reason to hold it until the state dump has arrived.
-	seen := map[string]bool{}
-	_, res.InitialState = s.wakeDrain(seen, "subscribe", func() {
+	w := &WakeSession{s: s, seen: map[string]bool{}}
+	_, w.state = s.wakeDrain(w.seen, "subscribe", func() {
 		s.conn.Write(BuildSubscribeDevID(s.cfg.Token, s.routingSessionID, s.nextSqnum(),
 			s.cfg.Token.AccessID, s.routingSessionID != 0, s.certResult.SessionKey, s.pwdKey))
 		if len(s.cfg.Token.ExtraTokenData) > 0 {
 			s.conn.Write(BuildSubscribeTokens(s.cfg.Token, s.routingSessionID, s.nextSqnum(),
 				s.cfg.Token.ExtraTokenData, s.routingSessionID != 0, s.certResult.SessionKey, s.pwdKey))
 		}
-	}, opts.SubscribeDrain, false)
+	}, drain, false)
+	return w, nil
+}
 
-	online, state := s.wakeDrain(seen, "passthrough", func() {
+// Close ends the session.
+func (w *WakeSession) Close() { w.s.Close() }
+
+// ServerAddr returns the P2P server this session is connected to.
+func (w *WakeSession) ServerAddr() string { return w.s.serverAddr }
+
+// Devices returns the account's P2P device list as this session knows it.
+func (w *WakeSession) Devices() []DeviceInfo { return w.s.devices }
+
+// Send sends one passthrough message to the device and waits up to
+// opts.Listen for it to publish a fresh "_online" state. It can be
+// called repeatedly on the same session.
+func (w *WakeSession) Send(opts WakeOptions) WakeResult {
+	s := w.s
+	// Frames that arrived since the last Send (for instance the second
+	// half of the previous online report) must not pass for an answer
+	// to this message.
+	w.flush()
+	online, state := s.wakeDrain(w.seen, "passthrough", func() {
 		frame, msgID := BuildPassthroughMsg(s.cfg.Token, s.routingSessionID, s.nextSqnum(),
 			s.targetDev.TID, opts.Wake, opts.Data, s.certResult.SessionKey, s.pwdKey)
-		log.Printf("%s sending passthrough to %q TID=0x%016X wake=%v msgID=0x%08X (%d bytes)",
-			s.prefix, s.targetDev.Name, s.targetDev.TID, opts.Wake, msgID, len(frame))
+		log.Printf("%s sending passthrough to %q TID=0x%016X routing=0x%016X wake=%v msgID=0x%08X (%d bytes)",
+			s.prefix, s.targetDev.Name, s.targetDev.TID, s.routingSessionID, opts.Wake, msgID, len(frame))
 		s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.conn.Write(frame)
 	}, opts.Listen, opts.StopOnOnline)
-	if res.InitialState == DeviceStateUnknown {
-		res.InitialState = state
+	if w.state == DeviceStateUnknown {
+		w.state = state
 	}
-	res.Online = online
+	return WakeResult{Online: online, InitialState: w.state}
+}
+
+// flush discards whatever is waiting on the socket, remembering it so
+// a later resend of the same frame is ignored too.
+func (w *WakeSession) flush() {
+	buf := make([]byte, 8192)
+	for i := 0; i < 256; i++ {
+		w.s.conn.SetReadDeadline(time.Now().Add(2 * time.Millisecond))
+		n, err := w.s.conn.Read(buf)
+		if err != nil {
+			return
+		}
+		dec, _ := TryDecrypt(buf, n, w.s.certResult.SessionKey, w.s.pwdKey)
+		if dec == nil || n < FrameHeaderSize {
+			continue
+		}
+		if len(dec) > n {
+			dec = dec[:n]
+		}
+		w.seen[string(dec[:12])+string(dec[FrameHeaderSize:])] = true
+	}
+}
+
+// idle reads (and logs, when verbose) frames for d without sending a
+// message, optionally sending a session heartbeat every beat.
+func (w *WakeSession) idle(d, beat time.Duration) {
+	s := w.s
+	until := time.Now().Add(d)
+	for time.Now().Before(until) {
+		step := time.Until(until)
+		send := func() {}
+		if beat > 0 {
+			if step > beat {
+				step = beat
+			}
+			send = func() {
+				s.conn.Write(BuildHeartbeat(s.cfg.Token, s.routingSessionID, s.nextSqnum(), s.certResult.SessionKey, s.pwdKey))
+			}
+		}
+		s.wakeDrain(w.seen, "idle", send, step, false)
+	}
+}
+
+// Wake opens a session, sends one wake message to the target device
+// (plus opts.Repeat more), and closes the session. It is the one-shot
+// form the gwell-wake diagnostic uses; the bridge keeps a WakeSession
+// open instead. It never starts a call or a media session.
+func (s *Session) Wake(opts WakeOptions) (WakeResult, error) {
+	s.Close() // only s.cfg is used; the session below is separate
+	w, err := OpenWakeSession(s.cfg, opts.SubscribeDrain)
+	if err != nil {
+		return WakeResult{}, err
+	}
+	defer w.Close()
+
+	res := w.Send(opts)
+	for i := 0; i < opts.Repeat; i++ {
+		w.idle(opts.RepeatEvery, opts.Heartbeat)
+		res = w.Send(opts)
+		log.Printf("%s repeat %d online=%v", w.s.prefix, i+1, res.Online)
+	}
 	return res, nil
 }
 

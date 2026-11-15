@@ -22,7 +22,14 @@ func main() {
 	payload := flag.String("payload", "{}", "passthrough message body")
 	wake := flag.Bool("wake", true, "set the wake-device flag")
 	listen := flag.Duration("listen", 10*time.Second, "how long to log server replies after sending")
+	server := flag.String("server", "", "P2P server host:port to use, skipping discovery (the bridge logs it as \"gwell p2p server ready\")")
+	drain := flag.Duration("drain", 2*time.Second, "how long to read the server's state dump before sending")
+	repeat := flag.Int("repeat", 0, "send the message this many more times on the same session")
+	every := flag.Duration("every", 10*time.Second, "gap between repeated messages")
+	heartbeat := flag.Duration("heartbeat", 0, "send a session heartbeat this often between repeated messages (0 = none)")
+	tid := flag.Uint64("tid", 0, "the device's P2P id (logged as TID=0x...), for when the server omits the device list from a session opened right after another one")
 	flag.Parse()
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *device == "" {
 		log.Fatal("-device is required")
 	}
@@ -48,9 +55,14 @@ func main() {
 		log.Fatalf("token: %v", err)
 	}
 
-	sess := gwell.NewSession(gwell.SessionConfig{Token: token, DeviceName: *device})
+	cfg := gwell.SessionConfig{Token: token, ServerAddr: *server, DeviceName: *device}
+	if *tid != 0 {
+		cfg.Devices = []gwell.DeviceInfo{{TID: *tid, Name: *device}}
+	}
+	sess := gwell.NewSession(cfg)
 	gwell.WakeVerbose = true
-	res, err := sess.Wake(gwell.WakeOptions{Data: []byte(*payload), Wake: *wake, Listen: *listen, SubscribeDrain: 2 * time.Second})
+	res, err := sess.Wake(gwell.WakeOptions{Data: []byte(*payload), Wake: *wake, Listen: *listen, SubscribeDrain: *drain,
+		StopOnOnline: *repeat > 0, Repeat: *repeat, RepeatEvery: *every, Heartbeat: *heartbeat})
 	if err != nil {
 		log.Fatalf("wake: %v", err)
 	}

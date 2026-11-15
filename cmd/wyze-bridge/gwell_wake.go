@@ -23,6 +23,13 @@ const (
 	// longer keeps running in the background while the request goes
 	// ahead, and a retry sends a fresh wake.
 	gwellWakeBudget = 3500 * time.Millisecond
+	// gwellSessionReuse is how long the P2P session is kept open after
+	// a wake so the next wake can reuse it. The P2P server ignores a new
+	// session opened within roughly 17s of the previous one, which made
+	// back-to-back stream requests fail; a session reused 45s later
+	// still worked and one reused 75s later did not. Closing at 30s
+	// stays inside what works and keeps new sessions at least 30s apart.
+	gwellSessionReuse = 30 * time.Second
 	// gwellPrimeRetry spaces out retries of a failed Prime.
 	gwellPrimeRetry = 30 * time.Second
 	gwellPrimeTries = 4
@@ -41,8 +48,12 @@ type gwellWaker struct {
 	api *wyzeapi.Client
 
 	// runMu serializes P2P sessions: the Gwell P2P server mixes up
-	// frames when one account runs several handshakes at once.
-	runMu sync.Mutex
+	// frames when one account runs several handshakes at once. It also
+	// guards the kept-open session below.
+	runMu    sync.Mutex
+	sess     *gwell.WakeSession // session kept open for reuse, or nil
+	sessMac  string             // the doorbell sess targets
+	sessUsed time.Time          // when sess last carried a wake
 
 	mu        sync.Mutex
 	inflight  map[string]chan struct{} // mac -> closed when its wake ends
@@ -197,6 +208,22 @@ func (w *gwellWaker) wakeOnce(mac string) (gwell.WakeResult, error) {
 	w.runMu.Lock()
 	defer w.runMu.Unlock()
 
+	opts := gwell.WakeOptions{Data: []byte("{}"), Wake: true, Listen: gwellWakeListen, StopOnOnline: true}
+
+	// Reuse the open session when there is a fresh one for this doorbell.
+	if w.sess != nil {
+		if w.sessMac == mac && time.Since(w.sessUsed) < gwellSessionReuse {
+			if res := w.sess.Send(opts); res.Online {
+				w.sessUsed = time.Now()
+				return res, nil
+			}
+			// No answer: the session has probably gone stale. Fall
+			// through and try once on a new one.
+			log.Debug().Str("cam", mac).Msg("gwell p2p session gave no answer, reopening")
+		}
+		w.dropSession()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	accessID, accessToken, err := w.api.MarsRegisterGWUser(ctx, mac)
@@ -212,26 +239,55 @@ func (w *gwellWaker) wakeOnce(mac string) (gwell.WakeResult, error) {
 	server, devices := w.server, w.devices
 	w.mu.Unlock()
 
-	try := func(server string, devices []gwell.DeviceInfo) (gwell.WakeResult, error) {
-		sess := gwell.NewSession(gwell.SessionConfig{Token: token, ServerAddr: server, DeviceName: mac, Devices: devices})
-		res, err := sess.Wake(gwell.WakeOptions{
-			Data: []byte("{}"), Wake: true,
-			Listen: gwellWakeListen, StopOnOnline: true,
-		})
-		if err == nil {
-			w.mu.Lock()
-			w.server = sess.ServerAddr()
-			if d := sess.Devices(); len(d) > 0 {
-				w.devices = d
-			}
-			w.mu.Unlock()
-		}
-		return res, err
+	open := func(server string, devices []gwell.DeviceInfo) (*gwell.WakeSession, error) {
+		return gwell.OpenWakeSession(gwell.SessionConfig{Token: token, ServerAddr: server, DeviceName: mac, Devices: devices}, 0)
 	}
-	res, err := try(server, devices)
+	sess, err := open(server, devices)
 	if err != nil && server != "" {
 		// The remembered server or device list may be stale; start over.
-		res, err = try("", nil)
+		sess, err = open("", nil)
 	}
-	return res, err
+	if err != nil {
+		return gwell.WakeResult{}, err
+	}
+	w.mu.Lock()
+	w.server = sess.ServerAddr()
+	if d := sess.Devices(); len(d) > 0 {
+		w.devices = d
+	}
+	w.mu.Unlock()
+
+	res := sess.Send(opts)
+	if !res.Online {
+		// Nothing came back; a session like that is not worth keeping.
+		sess.Close()
+		return res, nil
+	}
+	w.sess, w.sessMac, w.sessUsed = sess, mac, time.Now()
+	time.AfterFunc(gwellSessionReuse, w.closeIdleSession)
+	return res, nil
+}
+
+// dropSession closes the kept-open session. Call with runMu held.
+func (w *gwellWaker) dropSession() {
+	if w.sess != nil {
+		w.sess.Close()
+		w.sess = nil
+	}
+}
+
+// closeIdleSession closes the kept-open session once it has gone
+// gwellSessionReuse without carrying a wake, and re-arms itself if the
+// session was used in the meantime.
+func (w *gwellWaker) closeIdleSession() {
+	w.runMu.Lock()
+	defer w.runMu.Unlock()
+	if w.sess == nil {
+		return
+	}
+	if idle := time.Since(w.sessUsed); idle < gwellSessionReuse {
+		time.AfterFunc(gwellSessionReuse-idle, w.closeIdleSession)
+		return
+	}
+	w.dropSession()
 }
