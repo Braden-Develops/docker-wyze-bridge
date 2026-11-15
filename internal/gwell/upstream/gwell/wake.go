@@ -37,6 +37,14 @@ const passthroughHeaderSize = 0x34
 // The gwell-wake diagnostic turns it on; the bridge leaves it off.
 var WakeVerbose bool
 
+// Device sleep states as the P2P server reports them in a device's
+// "_online" state value.
+const (
+	DeviceStateUnknown = 0 // the server sent no state for the device
+	DeviceStateAwake   = 1
+	DeviceStateAsleep  = 2
+)
+
 // WakeOptions controls one Wake call.
 type WakeOptions struct {
 	Data []byte // passthrough message body
@@ -47,10 +55,25 @@ type WakeOptions struct {
 	// StopOnOnline returns as soon as the device reports online instead
 	// of listening for the whole window.
 	StopOnOnline bool
-	// SubscribeDrain, if set, reads the server's initial state dump for
-	// this long before sending. Only the diagnostic needs it (to print
-	// that dump); the online check ignores the dump either way.
+	// SubscribeDrain, if set, reads the state dump for this long before
+	// sending. Only the diagnostic needs it (to print the dump and the
+	// device's state before the message goes out).
 	SubscribeDrain time.Duration
+}
+
+// WakeResult is what one Wake call observed.
+type WakeResult struct {
+	// Online is true when the device published a fresh online report
+	// after the message.
+	Online bool
+	// InitialState is the device's state from the state dump the server
+	// replays to a new session (DeviceStateAwake, DeviceStateAsleep, or
+	// DeviceStateUnknown: the server sometimes omits the dump from a
+	// session opened right after another one). It is informational. A
+	// Doorbell Pro that is already awake still needs the wake message
+	// and about 3s before it answers a WebRTC offer, so Wake waits for
+	// the online report whatever this says.
+	InitialState int
 }
 
 // BuildPassthroughMsg builds a 0xB9 passthrough frame addressed to dstID.
@@ -101,29 +124,32 @@ func (s *Session) Devices() []DeviceInfo { return s.devices }
 // Wake registers with the P2P server, subscribes, and sends one
 // passthrough message with the wake flag to the target device. It then
 // waits up to opts.Listen for the device to publish a fresh "_online"
-// state, and reports whether it did. It never starts a call or a media
-// session.
-func (s *Session) Wake(opts WakeOptions) (bool, error) {
+// state. It never starts a call or a media session.
+func (s *Session) Wake(opts WakeOptions) (WakeResult, error) {
 	defer s.Close()
+	var res WakeResult
 
 	if err := s.connect(); err != nil {
-		return false, fmt.Errorf("connect: %w", err)
+		return res, fmt.Errorf("connect: %w", err)
 	}
 	if err := s.certify(); err != nil {
-		return false, fmt.Errorf("certify: %w", err)
+		return res, fmt.Errorf("certify: %w", err)
 	}
 	if len(s.cfg.Devices) > 0 {
 		s.devices = s.cfg.Devices
 	}
 	if err := s.initInfo(); err != nil {
-		return false, fmt.Errorf("initInfo: %w", err)
+		return res, fmt.Errorf("initInfo: %w", err)
 	}
 	if s.cfg.DeviceName != "" && s.targetDev.Name != s.cfg.DeviceName {
-		return false, fmt.Errorf("device %q is not on this account's P2P device list", s.cfg.DeviceName)
+		return res, fmt.Errorf("device %q is not on this account's P2P device list", s.cfg.DeviceName)
 	}
 
+	// The subscribe and the wake message go out back to back: the
+	// message is needed whatever the device's state, so there is no
+	// reason to hold it until the state dump has arrived.
 	seen := map[string]bool{}
-	s.wakeDrain(seen, "subscribe", func() {
+	_, res.InitialState = s.wakeDrain(seen, "subscribe", func() {
 		s.conn.Write(BuildSubscribeDevID(s.cfg.Token, s.routingSessionID, s.nextSqnum(),
 			s.cfg.Token.AccessID, s.routingSessionID != 0, s.certResult.SessionKey, s.pwdKey))
 		if len(s.cfg.Token.ExtraTokenData) > 0 {
@@ -132,7 +158,7 @@ func (s *Session) Wake(opts WakeOptions) (bool, error) {
 		}
 	}, opts.SubscribeDrain, false)
 
-	online := s.wakeDrain(seen, "passthrough", func() {
+	online, state := s.wakeDrain(seen, "passthrough", func() {
 		frame, msgID := BuildPassthroughMsg(s.cfg.Token, s.routingSessionID, s.nextSqnum(),
 			s.targetDev.TID, opts.Wake, opts.Data, s.certResult.SessionKey, s.pwdKey)
 		log.Printf("%s sending passthrough to %q TID=0x%016X wake=%v msgID=0x%08X (%d bytes)",
@@ -140,37 +166,73 @@ func (s *Session) Wake(opts WakeOptions) (bool, error) {
 		s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.conn.Write(frame)
 	}, opts.Listen, opts.StopOnOnline)
-	return online, nil
+	if res.InitialState == DeviceStateUnknown {
+		res.InitialState = state
+	}
+	res.Online = online
+	return res, nil
 }
 
-// isOnlineReport reports whether body (a 0xAA device-state frame's
-// payload) is the target device publishing a fresh "_online" state.
-// The publishing device's id sits at body[10:18]. A fresh report is an
-// update addressed by path ("ProReadonly._online." or "ProReadonly."
-// followed by the changed members); the full state dump the server
-// replays to every new session starts with {"ProReadonly": and says
-// nothing about whether the device is awake now.
+// fromTarget reports whether body (a 0xAA device-state frame's payload)
+// was published by the target device, whose id sits at body[10:18].
+func (s *Session) fromTarget(body []byte) bool {
+	return len(body) >= 18 && binary.LittleEndian.Uint64(body[10:18]) == s.targetDev.TID
+}
+
+// stateDumpMarker opens the full state dump the server replays to every
+// new session, as opposed to an update addressed by path.
+var stateDumpMarker = []byte(`{"ProReadonly":`)
+
+// isOnlineReport reports whether body is the target device publishing a
+// fresh "_online" state: an update addressed by path
+// ("ProReadonly._online." or "ProReadonly." followed by the changed
+// members). The replayed state dump is not a fresh report.
 func (s *Session) isOnlineReport(body []byte) bool {
-	if len(body) < 18 || binary.LittleEndian.Uint64(body[10:18]) != s.targetDev.TID {
-		return false
-	}
-	if bytes.Contains(body, []byte(`{"ProReadonly":`)) {
+	if !s.fromTarget(body) || bytes.Contains(body, stateDumpMarker) {
 		return false
 	}
 	return bytes.Contains(body, []byte("_online"))
 }
 
-// wakeDrain runs send, then reads frames for d. It returns true if the
-// target device published a fresh online state; with stopOnOnline it
-// returns as soon as that happens. The server re-sends frames we never
-// ack, so repeats (tracked in seen) are ignored.
-func (s *Session) wakeDrain(seen map[string]bool, phase string, send func(), d time.Duration, stopOnOnline bool) bool {
+// dumpState returns the target device's sleep state from body if body
+// is its replayed state dump, else DeviceStateUnknown.
+func (s *Session) dumpState(body []byte) int {
+	if !s.fromTarget(body) || !bytes.Contains(body, stateDumpMarker) {
+		return DeviceStateUnknown
+	}
+	const key = `"_online":{"stVal":`
+	i := bytes.Index(body, []byte(key))
+	if i < 0 || i+len(key) >= len(body) {
+		return DeviceStateUnknown
+	}
+	switch body[i+len(key)] {
+	case '1':
+		return DeviceStateAwake
+	case '2':
+		return DeviceStateAsleep
+	}
+	return DeviceStateUnknown
+}
+
+// wakeDrain runs send, then reads frames for up to d. It returns
+// whether the target device published a fresh online report, and the
+// target's sleep state if its replayed state dump went by. With
+// stopOnOnline it returns as soon as the online report arrives. The
+// server re-sends frames we never ack, so repeats (tracked in seen) are
+// ignored.
+func (s *Session) wakeDrain(seen map[string]bool, phase string, send func(), d time.Duration, stopOnOnline bool) (online bool, state int) {
 	send()
-	online := false
 	buf := make([]byte, 8192)
 	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			break
+		}
+		if left > 500*time.Millisecond {
+			left = 500 * time.Millisecond
+		}
+		s.conn.SetReadDeadline(time.Now().Add(left))
 		n, err := s.conn.Read(buf)
 		if err != nil {
 			continue
@@ -190,29 +252,32 @@ func (s *Session) wakeDrain(seen map[string]bool, phase string, send func(), d t
 		}
 		seen[key] = true
 		body := show[FrameHeaderSize:]
-		if dec[1] == 0xAA {
-			if s.isOnlineReport(body) {
-				online = true
-			}
+		if dec[1] != 0xAA {
 			if WakeVerbose {
-				text := make([]byte, 0, len(body))
-				for _, b := range body {
-					if b >= 0x20 && b < 0x7f {
-						text = append(text, b)
-					} else {
-						text = append(text, '.')
-					}
-				}
-				log.Printf("%s %s rx: sub=0xAA len=%d (%s) %s", s.prefix, phase, n, mode, text)
-			}
-			if online && stopOnOnline {
-				return true
+				log.Printf("%s %s rx: sub=0x%02X len=%d (%s) %s", s.prefix, phase, dec[1], n, mode, hex.EncodeToString(body))
 			}
 			continue
 		}
+		if s.isOnlineReport(body) {
+			online = true
+		}
+		if st := s.dumpState(body); st != DeviceStateUnknown {
+			state = st
+		}
 		if WakeVerbose {
-			log.Printf("%s %s rx: sub=0x%02X len=%d (%s) %s", s.prefix, phase, dec[1], n, mode, hex.EncodeToString(body))
+			text := make([]byte, 0, len(body))
+			for _, b := range body {
+				if b >= 0x20 && b < 0x7f {
+					text = append(text, b)
+				} else {
+					text = append(text, '.')
+				}
+			}
+			log.Printf("%s %s rx: sub=0xAA len=%d (%s) %s", s.prefix, phase, n, mode, text)
+		}
+		if online && stopOnOnline {
+			break
 		}
 	}
-	return online
+	return online, state
 }

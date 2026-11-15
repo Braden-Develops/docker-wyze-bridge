@@ -50,9 +50,9 @@ func main() {
 
 	sess := gwell.NewSession(gwell.SessionConfig{Token: token, DeviceName: *device})
 	gwell.WakeVerbose = true
-	online, err := sess.Wake(gwell.WakeOptions{Data: []byte(*payload), Wake: *wake, Listen: *listen, SubscribeDrain: 2 * time.Second})
+	res, err := sess.Wake(gwell.WakeOptions{Data: []byte(*payload), Wake: *wake, Listen: *listen, SubscribeDrain: 2 * time.Second})
 	if err != nil {
 		log.Fatalf("wake: %v", err)
 	}
-	fmt.Printf("done online=%v\n", online)
+	fmt.Printf("done initial_state=%d online=%v\n", res.InitialState, res.Online)
 }

@@ -243,7 +243,7 @@ func main() {
 	// sleeping Gwell doorbell so its first stream request is not held up
 	// by P2P server discovery. One account shares one P2P server, so the
 	// first doorbell found is enough; a doorbell added later is primed
-	// by its first wake instead.
+	// from the camera-added callback.
 	for _, cam := range camMgr.Cameras() {
 		if info := cam.GetInfo(); info.NeedsWake() && info.IsGwell() {
 			gwellWake.Prime(info.MAC)
@@ -325,7 +325,7 @@ func main() {
 		}
 	})
 
-	wireCameraStateChanges(ctx, cfg, camMgr, webServer, mqttClient, webhookClient, apiClient, recMgr, state)
+	wireCameraStateChanges(ctx, cfg, camMgr, webServer, mqttClient, webhookClient, apiClient, recMgr, state, gwellWake)
 
 	snapLog := log.With().Str("c", "snapshot").Logger()
 	snapMgr := snapshot.NewManager(cfg, camMgr, go2rtcAPI, snapLog)
@@ -512,7 +512,7 @@ func setupWebhooks(cfg *config.Config) *webhooks.Client {
 	return webhookClient
 }
 
-func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *camera.Manager, webServer *webui.Server, mqttClient *mqtt.Client, webhookClient *webhooks.Client, apiClient *wyzeapi.Client, recMgr *recording.Manager, state *wyzeapi.StateFile) {
+func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *camera.Manager, webServer *webui.Server, mqttClient *mqtt.Client, webhookClient *webhooks.Client, apiClient *wyzeapi.Client, recMgr *recording.Manager, state *wyzeapi.StateFile, gwellWake *gwellWaker) {
 	camMgr.OnStateChange(func(cam *camera.Camera, oldState, newState camera.State) {
 		name := cam.Name()
 		snap := cam.Snapshot()
@@ -565,6 +565,11 @@ func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *cam
 		}
 	})
 	camMgr.OnCameraAdded(func(cam *camera.Camera) {
+		// A sleeping Gwell doorbell that shows up after startup gets
+		// its P2P wake path readied here (a no-op once a server is known).
+		if info := cam.GetInfo(); info.NeedsWake() && info.IsGwell() {
+			gwellWake.Prime(info.MAC)
+		}
 		go webServer.SSE().SendJSON("camera_added", map[string]interface{}{"name": cam.Name()})
 		if mqttClient != nil && mqttClient.IsConnected() {
 			go mqttClient.PublishDiscovery(cam)

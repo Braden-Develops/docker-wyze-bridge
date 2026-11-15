@@ -76,3 +76,31 @@ func TestIsOnlineReport(t *testing.T) {
 		t.Error("another device's state counted as the target's")
 	}
 }
+
+func TestDumpState(t *testing.T) {
+	s := &Session{targetDev: DeviceInfo{TID: 0x000186D600132074}}
+	withBody := func(tid uint64, text string) []byte {
+		b := make([]byte, 19)
+		binary.LittleEndian.PutUint64(b[10:18], tid)
+		return append(b, text...)
+	}
+	cases := []struct {
+		tid  uint64
+		text string
+		want int
+	}{
+		{s.targetDev.TID, `{"ProReadonly":{"_online":{"stVal":1,"t":1794763130},"power":{}}}`, DeviceStateAwake},
+		{s.targetDev.TID, `{"ProReadonly":{"_online":{"stVal":2,"t":1794763024},"power":{}}}`, DeviceStateAsleep},
+		// A fresh update is not the replayed dump.
+		{s.targetDev.TID, `ProReadonly._online.{"stVal":1,"t":1794763130}`, DeviceStateUnknown},
+		// Another device's dump (the chime) says nothing about the target.
+		{0x000186D600134B6C, `{"ProReadonly":{"_online":{"stVal":1,"t":1}}}`, DeviceStateUnknown},
+		{s.targetDev.TID, `{"ProReadonly":{"power":{}}}`, DeviceStateUnknown},
+		{s.targetDev.TID, `{"ProReadonly":{"_online":{"stVal":`, DeviceStateUnknown},
+	}
+	for _, c := range cases {
+		if got := s.dumpState(withBody(c.tid, c.text)); got != c.want {
+			t.Errorf("dumpState(%q) = %d, want %d", c.text, got, c.want)
+		}
+	}
+}

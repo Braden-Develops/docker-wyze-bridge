@@ -20,13 +20,12 @@ const (
 	gwellWakeListen = 10 * time.Second
 	// gwellWakeBudget is how long a stream request waits on a wake.
 	// go2rtc gives the shim 5s in total to answer; a wake that needs
-	// longer keeps running in the background and the next attempt finds
-	// the doorbell awake.
+	// longer keeps running in the background while the request goes
+	// ahead, and a retry sends a fresh wake.
 	gwellWakeBudget = 3500 * time.Millisecond
-	// gwellAwakeWindow is how long after an online report the doorbell
-	// is assumed still awake, so retries skip the wake. Its firmware
-	// drops back to sleep roughly 20s after the last session.
-	gwellAwakeWindow = 15 * time.Second
+	// gwellPrimeRetry spaces out retries of a failed Prime.
+	gwellPrimeRetry = 30 * time.Second
+	gwellPrimeTries = 4
 )
 
 // errGwellWakePending means the wake is still running in the
@@ -45,21 +44,21 @@ type gwellWaker struct {
 	// frames when one account runs several handshakes at once.
 	runMu sync.Mutex
 
-	mu         sync.Mutex
-	inflight   map[string]chan struct{} // mac -> closed when its wake ends
-	lastOnline map[string]time.Time     // mac -> last confirmed online report
-	lastErr    map[string]error         // mac -> result of the last finished wake
-	server     string                   // P2P server that last worked (skips ~6s discovery)
-	priming    bool                     // a Prime is running
-	devices    []gwell.DeviceInfo       // account device list (server may omit it on back-to-back sessions)
+	mu        sync.Mutex
+	inflight  map[string]chan struct{} // mac -> closed when its wake ends
+	lastAwake map[string]bool          // mac -> last finished wake confirmed the doorbell awake
+	lastErr   map[string]error         // mac -> error of the last finished wake
+	server    string                   // P2P server that last worked (skips ~6s discovery)
+	priming   bool                     // a Prime is running
+	devices   []gwell.DeviceInfo       // account device list (server may omit it on back-to-back sessions)
 }
 
 func newGwellWaker(api *wyzeapi.Client) *gwellWaker {
 	return &gwellWaker{
-		api:        api,
-		inflight:   map[string]chan struct{}{},
-		lastOnline: map[string]time.Time{},
-		lastErr:    map[string]error{},
+		api:       api,
+		inflight:  map[string]chan struct{}{},
+		lastAwake: map[string]bool{},
+		lastErr:   map[string]error{},
 	}
 }
 
@@ -79,17 +78,25 @@ func (w *gwellWaker) Prime(mac string) {
 	w.mu.Unlock()
 
 	go func() {
-		err := w.primeOnce(mac)
+		var err error
+		for try := 1; try <= gwellPrimeTries; try++ {
+			if err = w.primeOnce(mac); err == nil {
+				break
+			}
+			// Not fatal: a wake discovers for itself if priming never
+			// succeeds (network or Wyze down at startup).
+			log.Warn().Err(err).Str("cam", mac).Int("try", try).Msg("gwell p2p prime failed")
+			if try < gwellPrimeTries {
+				time.Sleep(gwellPrimeRetry)
+			}
+		}
 		w.mu.Lock()
 		w.priming = false
 		server := w.server
 		w.mu.Unlock()
-		if err != nil {
-			// Not fatal: the first wake will discover for itself.
-			log.Warn().Err(err).Str("cam", mac).Msg("gwell p2p prime failed")
-			return
+		if err == nil {
+			log.Info().Str("cam", mac).Str("server", server).Msg("gwell p2p server ready")
 		}
-		log.Info().Str("cam", mac).Str("server", server).Msg("gwell p2p server ready")
 	}()
 }
 
@@ -128,15 +135,18 @@ func (w *gwellWaker) primeOnce(mac string) error {
 	return nil
 }
 
-// Wake returns nil once the doorbell is confirmed awake. It returns
-// errGwellWakePending if that takes longer than gwellWakeBudget (the
-// wake carries on in the background), or the wake's own error.
+// Wake sends the doorbell a wake message and returns nil once it is
+// confirmed awake. It returns errGwellWakePending if that takes longer
+// than gwellWakeBudget (the wake carries on in the background), or the
+// wake's own error.
+//
+// Every call sends a message and waits, even seconds after the last
+// one. A Doorbell Pro that is still awake from a previous session
+// ignores a WebRTC offer unless a wake message came first, and needs
+// about 3s after the message just as a sleeping one does. A call made
+// while a wake is already in flight joins it.
 func (w *gwellWaker) Wake(ctx context.Context, mac string) error {
 	w.mu.Lock()
-	if time.Since(w.lastOnline[mac]) < gwellAwakeWindow {
-		w.mu.Unlock()
-		return nil
-	}
 	done, running := w.inflight[mac]
 	if !running {
 		done = make(chan struct{})
@@ -158,7 +168,7 @@ func (w *gwellWaker) Wake(ctx context.Context, mac string) error {
 	if err := w.lastErr[mac]; err != nil {
 		return err
 	}
-	if time.Since(w.lastOnline[mac]) < gwellAwakeWindow {
+	if w.lastAwake[mac] {
 		return nil
 	}
 	return fmt.Errorf("gwell p2p wake sent but the doorbell did not report online within %s", gwellWakeListen)
@@ -167,12 +177,10 @@ func (w *gwellWaker) Wake(ctx context.Context, mac string) error {
 // run performs one wake and records its outcome. It is not tied to the
 // request that started it, so a slow wake still finishes.
 func (w *gwellWaker) run(mac string, done chan struct{}) {
-	online, err := w.wakeOnce(mac)
+	res, err := w.wakeOnce(mac)
 	w.mu.Lock()
 	w.lastErr[mac] = err
-	if err == nil && online {
-		w.lastOnline[mac] = time.Now()
-	}
+	w.lastAwake[mac] = err == nil && res.Online
 	delete(w.inflight, mac)
 	w.mu.Unlock()
 	close(done)
@@ -181,10 +189,11 @@ func (w *gwellWaker) run(mac string, done chan struct{}) {
 		log.Warn().Err(err).Str("cam", mac).Msg("gwell p2p wake failed")
 		return
 	}
-	log.Info().Str("cam", mac).Bool("online", online).Msg("gwell p2p wake sent")
+	log.Info().Str("cam", mac).Bool("online", res.Online).
+		Bool("already_awake", res.InitialState == gwell.DeviceStateAwake).Msg("gwell p2p wake sent")
 }
 
-func (w *gwellWaker) wakeOnce(mac string) (bool, error) {
+func (w *gwellWaker) wakeOnce(mac string) (gwell.WakeResult, error) {
 	w.runMu.Lock()
 	defer w.runMu.Unlock()
 
@@ -192,20 +201,23 @@ func (w *gwellWaker) wakeOnce(mac string) (bool, error) {
 	defer cancel()
 	accessID, accessToken, err := w.api.MarsRegisterGWUser(ctx, mac)
 	if err != nil {
-		return false, fmt.Errorf("mars credential: %w", err)
+		return gwell.WakeResult{}, fmt.Errorf("mars credential: %w", err)
 	}
 	token, err := gwell.ParseAccessToken(accessID, accessToken)
 	if err != nil {
-		return false, fmt.Errorf("mars token: %w", err)
+		return gwell.WakeResult{}, fmt.Errorf("mars token: %w", err)
 	}
 
 	w.mu.Lock()
 	server, devices := w.server, w.devices
 	w.mu.Unlock()
 
-	try := func(server string, devices []gwell.DeviceInfo) (bool, error) {
+	try := func(server string, devices []gwell.DeviceInfo) (gwell.WakeResult, error) {
 		sess := gwell.NewSession(gwell.SessionConfig{Token: token, ServerAddr: server, DeviceName: mac, Devices: devices})
-		online, err := sess.Wake(gwell.WakeOptions{Data: []byte("{}"), Wake: true, Listen: gwellWakeListen, StopOnOnline: true})
+		res, err := sess.Wake(gwell.WakeOptions{
+			Data: []byte("{}"), Wake: true,
+			Listen: gwellWakeListen, StopOnOnline: true,
+		})
 		if err == nil {
 			w.mu.Lock()
 			w.server = sess.ServerAddr()
@@ -214,12 +226,12 @@ func (w *gwellWaker) wakeOnce(mac string) (bool, error) {
 			}
 			w.mu.Unlock()
 		}
-		return online, err
+		return res, err
 	}
-	online, err := try(server, devices)
+	res, err := try(server, devices)
 	if err != nil && server != "" {
 		// The remembered server or device list may be stale; start over.
-		online, err = try("", nil)
+		res, err = try("", nil)
 	}
-	return online, err
+	return res, err
 }
