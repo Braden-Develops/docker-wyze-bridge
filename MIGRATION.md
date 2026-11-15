@@ -188,7 +188,12 @@ Previously unsupported in the Python bridge, now handled in two ways:
   — go2rtc's native `#format=wyze` source dials Wyze's
   `wyze-mars-webcsrv.wyzecam.com` WebRTC signaling server itself; our
   shim provides the per-camera signaling URL and ICE servers. No
-  sidecar.
+  sidecar. These doorbells sleep between sessions, so the shim first
+  wakes them over Gwell P2P the way the Wyze app does (a passthrough
+  message with the wake flag); without it the doorbell never answers
+  the offer. Expect about 10 s to the first frame from a sleeping
+  doorbell. Turn the wake off for a model with
+  `MODEL_OVERRIDES=<model>:needs_wake=false`.
 
 ### Not Supported
 

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -190,6 +191,8 @@ func main() {
 		})
 	})
 
+	gwellWake := newGwellWaker(apiClient)
+
 	webuiLog := log.With().Str("c", "webui").Logger()
 	webServer := webui.NewServer(webui.Options{
 		Config:    cfg,
@@ -199,7 +202,7 @@ func main() {
 		RootCtx:   ctx,
 		Issues:    issueReg,
 		Mars:      apiClient,
-		KVS:       kvsAdapter{api: apiClient},
+		KVS:       kvsAdapter{api: apiClient, gwellWake: gwellWake},
 		Cloud:     apiClient,
 		AuthPhoneID: func() string {
 			if a := apiClient.Auth(); a != nil {
@@ -236,6 +239,18 @@ func main() {
 
 	go2rtcLog := log.With().Str("c", "go2rtc").Logger()
 	go2rtcAPI, go2rtcMgr := setupGo2RTC(ctx, cfg, camMgr, go2rtcLog)
+
+	// Initial discovery has run by now. Ready the P2P wake path for any
+	// sleeping Gwell doorbell so its first stream request is not held up
+	// by P2P server discovery. One account shares one P2P server, so the
+	// first doorbell found is enough; a doorbell added later is primed
+	// from the camera-added callback.
+	for _, cam := range camMgr.Cameras() {
+		if info := cam.GetInfo(); info.NeedsWake() && info.IsGwell() {
+			gwellWake.Prime(info.MAC)
+			break
+		}
+	}
 
 	// Inject the API client into camera manager and WebUI now that
 	// go2rtc is reachable. Any in-flight WebUI request that was waiting
@@ -311,7 +326,7 @@ func main() {
 		}
 	})
 
-	wireCameraStateChanges(ctx, cfg, camMgr, webServer, mqttClient, webhookClient, apiClient, recMgr, state)
+	wireCameraStateChanges(ctx, cfg, camMgr, webServer, mqttClient, webhookClient, apiClient, recMgr, state, gwellWake)
 
 	snapLog := log.With().Str("c", "snapshot").Logger()
 	snapMgr := snapshot.NewManager(cfg, camMgr, go2rtcAPI, snapLog)
@@ -498,7 +513,7 @@ func setupWebhooks(cfg *config.Config) *webhooks.Client {
 	return webhookClient
 }
 
-func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *camera.Manager, webServer *webui.Server, mqttClient *mqtt.Client, webhookClient *webhooks.Client, apiClient *wyzeapi.Client, recMgr *recording.Manager, state *wyzeapi.StateFile) {
+func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *camera.Manager, webServer *webui.Server, mqttClient *mqtt.Client, webhookClient *webhooks.Client, apiClient *wyzeapi.Client, recMgr *recording.Manager, state *wyzeapi.StateFile, gwellWake *gwellWaker) {
 	camMgr.OnStateChange(func(cam *camera.Camera, oldState, newState camera.State) {
 		name := cam.Name()
 		snap := cam.Snapshot()
@@ -551,6 +566,11 @@ func wireCameraStateChanges(ctx context.Context, cfg *config.Config, camMgr *cam
 		}
 	})
 	camMgr.OnCameraAdded(func(cam *camera.Camera) {
+		// A sleeping Gwell doorbell that shows up after startup gets
+		// its P2P wake path readied here (a no-op once a server is known).
+		if info := cam.GetInfo(); info.NeedsWake() && info.IsGwell() {
+			gwellWake.Prime(info.MAC)
+		}
 		go webServer.SSE().SendJSON("camera_added", map[string]interface{}{"name": cam.Name()})
 		if mqttClient != nil && mqttClient.IsConnected() {
 			go mqttClient.PublishDiscovery(cam)
@@ -934,7 +954,8 @@ func setupGo2RTC(ctx context.Context, cfg *config.Config, camMgr *camera.Manager
 // kvsAdapter glues wyzeapi.GetCameraKVSConfig to webui's
 // KVSStreamProvider interface; parsing lives in wyzeapi/webrtc.go.
 type kvsAdapter struct {
-	api *wyzeapi.Client
+	api       *wyzeapi.Client
+	gwellWake *gwellWaker
 }
 
 func (a kvsAdapter) GetCameraStream(_ context.Context, mac, model string) (string, []webui.KVSIceServer, string, error) {
@@ -947,6 +968,23 @@ func (a kvsAdapter) GetCameraStream(_ context.Context, mac, model string) (strin
 		ice = append(ice, webui.KVSIceServer{URL: s.URL, Username: s.Username, Credential: s.Credential})
 	}
 	return cfg.SignalingURL, ice, cfg.AuthToken, nil
+}
+
+// WakeCamera implements webui.KVSWaker for sleeping battery doorbells.
+// Gwell doorbells are woken over Gwell P2P; there is no wake method for
+// other lineages. A wake that is still running when the request has to
+// answer is reported as webui.ErrWakePending, so the shim asks the
+// client to retry instead of handing out a signaling URL too early.
+func (a kvsAdapter) WakeCamera(ctx context.Context, mac, model string) error {
+	cam := wyzeapi.CameraInfo{MAC: mac, Model: model}
+	if !cam.IsGwell() || a.gwellWake == nil {
+		return fmt.Errorf("no wake method for model %s", model)
+	}
+	err := a.gwellWake.Wake(ctx, mac)
+	if errors.Is(err, errGwellWakePending) {
+		return webui.ErrWakePending
+	}
+	return err
 }
 
 func findGo2RTCBinary() string {

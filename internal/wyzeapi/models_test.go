@@ -267,3 +267,11 @@ func TestCameraInfo_IsDoorbell(t *testing.T) {
 		t.Error("HL_CAM4 should not be a doorbell")
 	}
 }
+
+func TestNeedsWake(t *testing.T) {
+	for model, want := range map[string]bool{"GW_BE1": true, "GW_DBD": true, "GW_GC1": false, "HL_CAM4": false} {
+		if got := (CameraInfo{Model: model}).NeedsWake(); got != want {
+			t.Errorf("%s NeedsWake = %v, want %v", model, got, want)
+		}
+	}
+}

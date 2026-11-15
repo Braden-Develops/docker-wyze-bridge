@@ -24,6 +24,10 @@ type ModelSpec struct {
 	IsWebRTCStreamer bool
 	IsPan            bool
 	IsDoorbell       bool
+	// NeedsWake: battery-lineage models that sleep between sessions and
+	// ignore a WebRTC offer until woken. Gwell doorbells are woken with a
+	// Gwell P2P passthrough message (see cmd/wyze-bridge/gwell_wake.go).
+	NeedsWake bool
 }
 
 // modelRegistry is the single source of truth for per-model routing.
@@ -40,9 +44,9 @@ var modelRegistry = map[string]ModelSpec{
 	"HL_CFL2":        {Name: "Floodlight V2"},
 	"WYZEDB3":        {Name: "Doorbell", IsDoorbell: true},
 	"HL_DB2":         {Name: "Doorbell V2", IsDoorbell: true},
-	"GW_BE1":         {Name: "Doorbell Pro", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true},
-	"AN_RDB1":        {Name: "Doorbell Pro 2", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true},
-	"GW_DBD":         {Name: "Doorbell Duo", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true},
+	"GW_BE1":         {Name: "Doorbell Pro", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true, NeedsWake: true},
+	"AN_RDB1":        {Name: "Doorbell Pro 2", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true, NeedsWake: true},
+	"GW_DBD":         {Name: "Doorbell Duo", IsGwell: true, IsWebRTCStreamer: true, IsDoorbell: true, NeedsWake: true},
 	// OG cameras stream via Wyze's mars-webcsrv WebRTC backend
 	// (same path as the Doorbell Pro). The gwell-proxy LAN-direct
 	// path is no longer reliable for OG; users who still want it can
@@ -131,6 +135,8 @@ func ApplyModelOverrides(raw string) []ModelOverrideError {
 				spec.IsPan = parseBoolFlag(v)
 			case "is_doorbell":
 				spec.IsDoorbell = parseBoolFlag(v)
+			case "needs_wake":
+				spec.NeedsWake = parseBoolFlag(v)
 			default:
 				errs = append(errs, ModelOverrideError{Entry: entry, Err: fmt.Errorf("unknown flag %q", k)})
 				entryErr = true
@@ -219,6 +225,12 @@ func (c CameraInfo) IsWebRTCStreamer() bool {
 // IsPanCam returns true if this is a pan/tilt camera.
 func (c CameraInfo) IsPanCam() bool {
 	return modelRegistry[c.Model].IsPan
+}
+
+// NeedsWake returns true when the camera must be woken before it will
+// answer a WebRTC offer.
+func (c CameraInfo) NeedsWake() bool {
+	return modelRegistry[c.Model].NeedsWake
 }
 
 // IsDoorbell returns true if this is a doorbell camera.
