@@ -308,3 +308,49 @@ func TestHandleShimKVSSignaling_ForceWebRTCPassesGate(t *testing.T) {
 		t.Fatalf("status = %d body=%s; force-promoted camera should reach KVS", w.Code, w.Body.String())
 	}
 }
+
+// wakingKVSProvider records WakeCamera calls on top of fakeKVSProvider.
+type wakingKVSProvider struct {
+	fakeKVSProvider
+	woke    []string
+	wakeErr error
+}
+
+func (f *wakingKVSProvider) WakeCamera(_ context.Context, mac, model string) error {
+	f.woke = append(f.woke, model+"/"+mac)
+	return f.wakeErr
+}
+
+func TestHandleShimKVSSignaling_WakesSleepingDoorbell(t *testing.T) {
+	old := kvsWakeSettle
+	kvsWakeSettle = 0
+	defer func() { kvsWakeSettle = old }()
+
+	for _, tc := range []struct {
+		model    string
+		wantWake bool
+		wakeErr  error
+	}{
+		{"GW_BE1", true, nil},
+		{"GW_BE1", true, context.DeadlineExceeded}, // wake failure is non-fatal
+		{"GW_GC1", false, nil},                     // OG: WebRTC but always awake
+	} {
+		srv, _ := testServer(t)
+		cam := camera.NewCamera(wyzeapi.CameraInfo{Name: "cam", Model: tc.model, MAC: "MAC1"}, "hd", true, false)
+		srv.camMgr.InjectCamera("cam", cam)
+		p := &wakingKVSProvider{fakeKVSProvider: fakeKVSProvider{signalingURL: "wss://x"}, wakeErr: tc.wakeErr}
+		srv.kvs = p
+
+		req := httptest.NewRequest("GET", "/internal/wyze/webrtc/cam", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		w := httptest.NewRecorder()
+		srv.handleShimKVSSignaling(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d body=%s", tc.model, w.Code, w.Body.String())
+		}
+		if got := len(p.woke) == 1; got != tc.wantWake {
+			t.Errorf("%s: woke = %v, want wake %v", tc.model, p.woke, tc.wantWake)
+		}
+	}
+}

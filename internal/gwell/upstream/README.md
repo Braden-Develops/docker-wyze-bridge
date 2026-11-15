@@ -114,6 +114,15 @@ declaration, not across module paths.
    When rebasing, re-apply the reordering: try `TryDecrypt` first, skip
    if `nil`, then log the raw header and decrypted fields.
 
+8. **`gwell/wake.go` and `gwell/wake_test.go` are local additions.**
+   They add `BuildPassthroughMsg` (a `0xB9` passthrough frame whose
+   message-flag bit `0x2` asks the server to wake the destination
+   device) and `Session.Wake`, used by `cmd/wyze-bridge` to wake
+   sleeping Gwell doorbells and by the `cmd/gwell-wake` diagnostic.
+   No upstream file is modified. When rebasing, keep both files; they
+   only depend on `Session`'s connect/certify/initInfo steps and the
+   subscribe frame builders.
+
 ## Updating
 
 When upstream cuts a new commit:

@@ -199,7 +199,7 @@ func main() {
 		RootCtx:   ctx,
 		Issues:    issueReg,
 		Mars:      apiClient,
-		KVS:       kvsAdapter{api: apiClient},
+		KVS:       kvsAdapter{api: apiClient, gwellWake: newGwellWaker(apiClient)},
 		Cloud:     apiClient,
 		AuthPhoneID: func() string {
 			if a := apiClient.Auth(); a != nil {
@@ -934,7 +934,8 @@ func setupGo2RTC(ctx context.Context, cfg *config.Config, camMgr *camera.Manager
 // kvsAdapter glues wyzeapi.GetCameraKVSConfig to webui's
 // KVSStreamProvider interface; parsing lives in wyzeapi/webrtc.go.
 type kvsAdapter struct {
-	api *wyzeapi.Client
+	api       *wyzeapi.Client
+	gwellWake *gwellWaker
 }
 
 func (a kvsAdapter) GetCameraStream(_ context.Context, mac, model string) (string, []webui.KVSIceServer, string, error) {
@@ -947,6 +948,18 @@ func (a kvsAdapter) GetCameraStream(_ context.Context, mac, model string) (strin
 		ice = append(ice, webui.KVSIceServer{URL: s.URL, Username: s.Username, Credential: s.Credential})
 	}
 	return cfg.SignalingURL, ice, cfg.AuthToken, nil
+}
+
+// WakeCamera implements webui.KVSWaker for sleeping battery doorbells.
+// Gwell doorbells are woken over Gwell P2P; there is no wake method for
+// other lineages. errGwellWakePending means the wake is still running
+// in the background and the caller's retry will find the doorbell awake.
+func (a kvsAdapter) WakeCamera(ctx context.Context, mac, model string) error {
+	cam := wyzeapi.CameraInfo{MAC: mac, Model: model}
+	if !cam.IsGwell() || a.gwellWake == nil {
+		return fmt.Errorf("no wake method for model %s", model)
+	}
+	return a.gwellWake.Wake(ctx, mac)
 }
 
 func findGo2RTCBinary() string {
